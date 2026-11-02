@@ -9,6 +9,7 @@ Real-time ECG visualization and recording tool for Polar H10 heart rate monitor.
 - **Real-time ECG Visualization** - Smooth, continuous 130 Hz ECG signal display
 - **R-Peak Detection** - Automatic QRS complex detection with visual markers
 - **Heart Rate Monitoring** - Live BPM calculation with smoothing
+- **Multiple Devices** - Connect, stream and record several Polar H10 at the same time
 - **High-Precision Recording** - CSV export with microsecond-accurate timestamps
 - **Visual Recording Markers** - See exactly when recording started/stopped
 - **Analysis Tools** - Plot and validate recorded data
@@ -26,8 +27,8 @@ pip install -r requirements.txt
 ```
 
 **Requirements:**
-- Python 3.8+
-- Polar H10 heart rate monitor
+- Python 3.10+
+- Polar H10 heart rate monitor (one or more)
 - macOS, Linux, or Windows with Bluetooth LE support
 
 ## Quick Start
@@ -38,16 +39,20 @@ python main.py
 ```
 
 **Workflow:**
-1. Click **Scan Devices** → Select your Polar H10
-2. Click **Connect** → **Start Streaming**
-3. View real-time ECG and heart rate
+1. Click **Scan Devices** → Select one or more Polar H10 (Ctrl/Cmd-click)
+2. Click **Connect Selected** → **Start Streaming**
+3. View real-time ECG and heart rate (one panel per device)
+
+The buttons in the *Controls* bar act on all connected devices at once.
 
 ### Recording Data
 
-1. Enter Participant ID (e.g., "P001")
-2. Click **Select Save Location** → Choose where to save
+1. Enter a Participant ID (e.g., "P001") in each device panel (IDs must differ)
+2. Click **Select Save Folder** → Choose where to save
 3. Click **Start Recording** → Recording begins immediately
 4. Click **Stop Recording** when done
+
+Each device is saved to its own file: `ECG_<participant>_<time>.csv`.
 
 Green/red markers appear in plots showing exact start/stop times.
 
@@ -72,8 +77,8 @@ The analysis script provides:
 ## CSV Format
 
 ```csv
-participant_id,sample_datetime,packet_received_datetime,polar_timestamp_s,ecg_voltage_uv
-P001,2026-02-13T15:30:45.123456,2026-02-13T15:30:45.885456,0.000000,450.25
+participant_id,sample_datetime,packet_received_datetime,polar_timestamp_s,ecg_voltage_uv,device_name
+P001,2026-02-13T15:30:45.123456,2026-02-13T15:30:45.885456,0.000000,450.25,Polar H10 A1B2C3D4
 ```
 
 **Columns:**
@@ -82,6 +87,7 @@ P001,2026-02-13T15:30:45.123456,2026-02-13T15:30:45.885456,0.000000,450.25
 - `packet_received_datetime` - When BLE packet arrived (same for all samples in packet)
 - `polar_timestamp_s` - Polar internal clock (seconds)
 - `ecg_voltage_uv` - ECG voltage in microvolts
+- `device_name` - Which Polar H10 recorded the sample
 
 ## Configuration
 
@@ -140,7 +146,8 @@ When a BLE packet arrives (~100 samples):
 
 ```
 polar-ecg-viewer/
-├── main.py              # Main application (UI + real-time display)
+├── main.py              # Main window (device scan/connect + shared controls)
+├── device_panel.py      # One device: plots, BPM, recording
 ├── polar_backend.py     # BLE connection + R-peak detection
 ├── config.py            # Configuration parameters
 ├── plot_recording.py    # Recording analysis tool

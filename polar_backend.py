@@ -9,21 +9,70 @@ from datetime import datetime, timedelta
 from typing import Optional, Callable, List
 from dataclasses import dataclass
 from collections import deque
+from concurrent.futures import Future
+from threading import Thread
 
 import numpy as np
 from scipy.signal import find_peaks
 from bleak import BleakScanner
 from polar_python.device import PolarDevice
-from polar_python.models import MeasurementSettings, ECGData
-from polar_python.constants import PmdMeasurementType, PmdSettingType
+from polar_python.models import ECGData
 
-try:
-    from config import DEBUG_PEAK_DETECTION, BPM_SMOOTHING_WINDOW, ECG_BUFFER_SECONDS
-except ImportError:
-    # Fallback values if config not found
-    DEBUG_PEAK_DETECTION = False
-    BPM_SMOOTHING_WINDOW = 2
-    ECG_BUFFER_SECONDS = 30
+from config import (
+    DEBUG_PEAK_DETECTION, BPM_SMOOTHING_WINDOW, ECG_BUFFER_SECONDS,
+    ECG_RESOLUTION, DEVICE_SCAN_TIMEOUT, DEVICE_CONNECTION_TIMEOUT,
+)
+
+# BLE scanning/connecting must not overlap (concurrent scans conflict on some
+# platforms, e.g. macOS). The lock is created lazily so it binds to the
+# asyncio loop that actually uses it.
+_ble_lock: Optional[asyncio.Lock] = None
+
+
+def _get_ble_lock() -> asyncio.Lock:
+    global _ble_lock
+    if _ble_lock is None:
+        _ble_lock = asyncio.Lock()
+    return _ble_lock
+
+
+class BleLoop:
+    """asyncio event loop running in a background thread (keeps Qt responsive)"""
+
+    def __init__(self):
+        self._loop = asyncio.new_event_loop()
+        # asyncio only keeps weak references to running tasks. Without a strong
+        # reference, a task waiting on a BLE callback can be garbage-collected
+        # mid-flight (it silently never finishes), so we hold on to them here.
+        self._tasks: set = set()
+        self._thread = Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    async def _tracked(self, coro):
+        task = asyncio.current_task()
+        self._tasks.add(task)
+        try:
+            return await coro
+        finally:
+            self._tasks.discard(task)
+
+    def submit(self, coro) -> Future:
+        """Schedule a coroutine on the loop; returns a concurrent.futures.Future"""
+        return asyncio.run_coroutine_threadsafe(self._tracked(coro), self._loop)
+
+    def run_sync(self, coro, timeout: float):
+        """Run a coroutine and wait for it (used for clean shutdown)"""
+        return self.submit(coro).result(timeout)
+
+    def stop(self):
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=2.0)
+        if not self._loop.is_running():
+            self._loop.close()
 
 
 @dataclass
@@ -44,193 +93,188 @@ class RPeak:
 
 class PolarH10Handler:
     """
-    Handles connection to Polar H10 and streams ECG data with R-peak detection
+    Handles one Polar H10: BLE connection, ECG streaming and R-peak detection.
+
+    All state lives on the instance, so several handlers can run side by side
+    (one per device) on the same asyncio event loop.
     """
-    
-    def __init__(self, 
-                 ecg_callback: Callable[[List[ECGSample]], None],
-                 rpeak_callback: Callable[[RPeak], None],
+
+    def __init__(self,
+                 ecg_callback: Optional[Callable[[List[ECGSample]], None]] = None,
+                 rpeak_callback: Optional[Callable[[RPeak], None]] = None,
                  sample_rate: int = 130):
         """
         Initialize Polar H10 handler
-        
+
         Args:
             ecg_callback: Callback function for ECG data chunks
             rpeak_callback: Callback function for detected R-peaks
-            sample_rate: ECG sample rate in Hz (130 or 250)
+            sample_rate: ECG sample rate in Hz (130 for the H10)
         """
         self.ecg_callback = ecg_callback
         self.rpeak_callback = rpeak_callback
         self.sample_rate = sample_rate
-        
+
+        self.device_name: Optional[str] = None
         self.polar_device: Optional[PolarDevice] = None
         self.is_streaming = False
         self.start_time: Optional[float] = None
-        self._first_data_received = False  # For debug output
-        
-        # R-peak detection parameters
+
+        # R-peak detection state
         self.ecg_buffer = deque(maxlen=int(sample_rate * ECG_BUFFER_SECONDS))
+        self.recent_rris = deque(maxlen=BPM_SMOOTHING_WINDOW)  # RRI smoothing for BPM
+        self.recent_peaks = deque(maxlen=8)  # Recent peak heights (adaptive threshold)
+        self.peak_distance = int(sample_rate * 0.3)  # Min 300ms between R-peaks
+        self._reset_detection_state()
+
+    def _reset_detection_state(self):
+        """Clear everything that depends on the current streaming session"""
+        self.ecg_buffer.clear()
+        self.recent_rris.clear()
+        self.recent_peaks.clear()
         self.last_rpeak_time: Optional[float] = None
         self.last_debug_time: float = 0  # For throttling debug output
-        
-        # RRI smoothing for BPM calculation
-        self.recent_rris = deque(maxlen=BPM_SMOOTHING_WINDOW)
-        
-        # Adaptive threshold parameters
-        self.recent_peaks = deque(maxlen=8)  # Track recent peak heights
-        self.peak_distance = int(sample_rate * 0.3)  # Min 300ms between R-peaks
-        
-        # Signal quality tracking
         self.signal_initialized = False
-        
-    async def scan_devices(self, timeout: float = 5.0) -> List[str]:
+
+    @staticmethod
+    async def scan_devices(timeout: float = DEVICE_SCAN_TIMEOUT) -> List[str]:
         """
         Scan for available Polar devices
-        
+
         Returns:
-            List of device names found
+            Sorted list of unique device names found
         """
-        devices = await BleakScanner.discover(timeout=timeout)
-        polar_devices = [d.name for d in devices if d.name and "Polar" in d.name]
-        return polar_devices
-        
-    async def connect(self, device_name: str = "Polar H10") -> bool:
+        async with _get_ble_lock():
+            devices = await BleakScanner.discover(timeout=timeout)
+        return sorted({d.name for d in devices if d.name and "Polar" in d.name})
+
+    async def connect(self, device_name: str,
+                      timeout: float = DEVICE_CONNECTION_TIMEOUT) -> bool:
         """
-        Connect to Polar H10 device
-        
+        Connect to the Polar device with exactly this name
+
         Args:
-            device_name: Name of device to connect to
-            
+            device_name: Full device name as returned by scan_devices()
+            timeout: Seconds to wait for the device to be discovered
+
         Returns:
-            True if connection successful
+            True if connection successful, False if the device was not found
         """
-        # Find device
-        device = await BleakScanner.find_device_by_filter(
-            lambda bd, ad: bd.name and device_name in bd.name,
-            timeout=10
-        )
-        
-        if device is None:
-            return False
-            
-        # Connect to device (new API: no callback in constructor)
-        self.polar_device = PolarDevice(device)
-        await self.polar_device.__aenter__()
-        
+        async with _get_ble_lock():
+            device = await BleakScanner.find_device_by_filter(
+                lambda bd, ad: bd.name == device_name,
+                timeout=timeout
+            )
+            if device is None:
+                return False
+
+            polar_device = PolarDevice(device)
+            try:
+                # Never hang forever: bleak's own timeout does not cover the notification setup
+                await asyncio.wait_for(polar_device.connect(), timeout * 2)
+            except Exception:
+                await self._safe_disconnect(polar_device)
+                raise
+
+        self.polar_device = polar_device
+        self.device_name = device_name
         return True
-        
+
     async def start_streaming(self) -> bool:
         """
         Start ECG streaming
-        
+
         Returns:
             True if streaming started successfully
         """
         if self.polar_device is None:
             return False
-            
-        # Start ECG stream (new API: callback + params passed directly)
-        await self.polar_device.start_ecg_stream(
-            ecg_callback=self._data_callback,
-            sample_rate=self.sample_rate,
-            resolution=14,
-        )
-        self.is_streaming = True
+
+        # Fresh session: timestamps restart at 0, so old detection state is invalid
+        self._reset_detection_state()
         self.start_time = time.time()
-        
+        self.is_streaming = True  # Set first: data can arrive before the call returns
+        try:
+            await self.polar_device.start_ecg_stream(
+                ecg_callback=self._data_callback,
+                sample_rate=self.sample_rate,
+                resolution=ECG_RESOLUTION,
+            )
+        except Exception:
+            self.is_streaming = False
+            raise
         return True
-        
+
     async def stop_streaming(self):
         """Stop ECG streaming"""
         if self.polar_device and self.is_streaming:
-            await self.polar_device.stop_ecg_stream()
             self.is_streaming = False
-            
+            await self.polar_device.stop_ecg_stream()
+
     async def disconnect(self):
-        """Disconnect from device"""
-        if self.polar_device:
-            await self.polar_device.__aexit__(None, None, None)
-            self.polar_device = None
-            
-    def _data_callback(self, data: ECGData):
-        """
-        Internal callback for receiving ECG data from Polar device.
-        Called directly by polar_python with ECGData (new API).
-        """
-            
-        # Convert to ECGSample objects with timestamps
-        current_time = time.time()
-        time_offset = current_time - self.start_time if self.start_time else 0
-        
-        # ECGData might have 'data' or be iterable directly
-        ecg_values = None
-        attr_used = None
+        """Stop streaming (best effort) and disconnect from the device"""
+        device, self.polar_device = self.polar_device, None
+        if device is None:
+            return
+        if self.is_streaming:
+            self.is_streaming = False
+            try:
+                await device.stop_ecg_stream()
+            except Exception:
+                pass  # Disconnecting anyway
+        await self._safe_disconnect(device)
+
+    @staticmethod
+    async def _safe_disconnect(device: PolarDevice):
         try:
-            # Try different possible attribute names
-            if hasattr(data, 'samples'):
-                ecg_values = data.samples
-                attr_used = 'samples'
-            elif hasattr(data, 'data'):
-                ecg_values = data.data
-                attr_used = 'data'
-            elif hasattr(data, 'ecg_data'):
-                ecg_values = data.ecg_data
-                attr_used = 'ecg_data'
-            else:
-                # Try to iterate directly
-                ecg_values = list(data)
-                attr_used = 'direct iteration'
-                
-            # Debug output on first successful read
-            if not self._first_data_received and ecg_values:
-                if DEBUG_PEAK_DETECTION:
-                    print(f"✓ ECG data streaming - using attribute: {attr_used}")
-                    print(f"  Received {len(ecg_values)} samples")
-                self._first_data_received = True
-                
+            await device.disconnect()
         except Exception as e:
             if DEBUG_PEAK_DETECTION:
-                print(f"Error accessing ECG data: {e}")
-                print(f"ECGData attributes: {dir(data)}")
+                print(f"Error while disconnecting: {e}")
+
+    def _data_callback(self, data: ECGData):
+        """
+        Internal callback for ECG packets from polar_python.
+        Runs on the asyncio thread.
+        """
+        if not self.is_streaming or not data.data:
             return
-        
-        if not ecg_values:
-            if DEBUG_PEAK_DETECTION:
-                print("Warning: No ECG values found in data")
-            return
-        
+
+        ecg_values = data.data
+        time_offset = time.time() - self.start_time
+
         # Capture exact system datetime when this packet is received
         packet_receive_datetime = datetime.now()
-        
+
         samples = []
         for i, voltage in enumerate(ecg_values):
             # Polar internal timestamp
             polar_timestamp = time_offset + (i / self.sample_rate)
-            
+
             # Calculate system datetime for this sample:
             # The LAST sample gets the exact receive time
             # Earlier samples are back-calculated using sample rate
             samples_from_end = len(ecg_values) - 1 - i
             time_offset_from_last = samples_from_end / self.sample_rate
             sample_datetime = packet_receive_datetime - timedelta(seconds=time_offset_from_last)
-            
+
             sample = ECGSample(
-                timestamp=polar_timestamp, 
+                timestamp=polar_timestamp,
                 voltage=float(voltage),
                 system_receive_time=sample_datetime
             )
             samples.append(sample)
-            
+
             # Add to buffer for R-peak detection
             self.ecg_buffer.append(sample)
-            
+
         # Send ECG data to callback
         if self.ecg_callback:
             self.ecg_callback(samples)
-            
-        # Perform R-peak detection on buffer (checks periodically, not every time)
+
+        # Perform R-peak detection on buffer
         self._detect_rpeaks()
-        
+
     def _detect_rpeaks(self):
         """
         Detect R-peaks in the ECG buffer using improved adaptive algorithm

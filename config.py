@@ -28,6 +28,10 @@ BPM_SMOOTHING_WINDOW = 2     # Average over N RR intervals for smoother BPM
 BPM_AVERAGE_WINDOW_SECONDS = DISPLAY_WINDOW_SECONDS  # Window for "Add Average Line" button
 BPM_Y_AXIS_PADDING = 10      # BPM padding above/below min/max (±10 BPM)
 
+# HRV (heart rate variability), computed from RR intervals
+HRV_WINDOW_SECONDS = 30      # RMSSD/SDNN use the RR intervals of the last N seconds
+HRV_MIN_INTERVALS = 5        # Need at least this many valid RR intervals
+
 # BPM Display
 BPM_Y_RANGE = (40, 180)
 
